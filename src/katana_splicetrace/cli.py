@@ -1,4 +1,4 @@
-"""Standalone CLI for katana-splicetrace (2.4.1) with Extensible Motif Database v3.0."""
+"""Standalone CLI for katana-splicetrace (2.4.2) with Extensible Motif Database v3.0."""
 from __future__ import annotations
 
 import argparse
@@ -16,13 +16,13 @@ from katana_splicetrace.protein_consequences import trace_protein_and_nmd_conseq
 from katana_splicetrace.rna_forms import IndexedFasta, compute_flank_gc_fast, extract_event_rna_v2, trace_motif_instances_v2
 from katana_splicetrace.scanner import run_motiftrace_v2_scan
 
-__version__ = "2.4.1"
+__version__ = "2.4.2"
 
 
 def write_nfcore_versions_yml(path: Path | str, process_name: str = "KATANA_SPLICETRACE") -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(f'"{process_name}":\n    katana-splicetrace: "2.4.1"\n    python: "{platform.python_version()}"\n', encoding="utf-8")
+    p.write_text(f'"{process_name}":\n    katana-splicetrace: "2.4.2"\n    python: "{platform.python_version()}"\n', encoding="utf-8")
 
 
 def add_extensible_library_args(parser: argparse.ArgumentParser) -> None:
@@ -122,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--foreground", type=Path, default=None, help="Discrete foreground event table (.tsv or .parquet)")
     parser.add_argument("--background", type=Path, default=None, help="Discrete background pool event table (.tsv or .parquet)")
     parser.add_argument("--fasta", type=Path, required=False, help="Indexed reference genome FASTA (.fa with .fa.fai)")
+    parser.add_argument("--events", type=Path, default=None, help="Standalone event coordinate table for --gtf consequence-only or --splicenet-modules bridge runs")
+    parser.add_argument("--splicenet-modules", type=Path, default=None, help="Optional SpliceNet module_assignments.tsv to compute Module x RBP motif bridge")
     parser.add_argument("--gtf", type=Path, default=None, help="Optional reference annotation GTF (.gtf/.gtf.gz) for automated ORF, frameshift, NMD & protein domain consequence tracing")
     parser.add_argument("--threads", type=int, default=0, help="Number of CPU threads for Numba server acceleration (0 = auto-detect SLURM_CPUS_PER_TASK / all cores)")
     parser.add_argument("--output-dir", type=Path, required=False, help="Output directory")
@@ -213,6 +215,24 @@ def main(argv: list[str] | None = None) -> int:
             res["clusters"].to_csv(out_dir / "clusters_v2.tsv", sep="\t", index=False)
             res["rbp_ranking_all"].to_csv(out_dir / "rbp_ranking_all_v2.tsv", sep="\t", index=False)
             receipt = {"version": __version__, "library": lib.name, "n_rbps": lib.n_rbps, "mode": "discrete_matched_v2", "matched_events": int(len(m_ok)), "significant_rbps_fwer05": int((res["rbp_ranking_all"]["rbp_P_FWER"] <= 0.05).sum()), "elapsed_seconds": round(time.monotonic() - t0, 2)}
+        if args.gtf is not None:
+            prot_df = trace_protein_and_nmd_consequences(fg.head(500), args.gtf, args.fasta, indexed_fasta_cls=IndexedFasta, species=args.species)
+            prot_df.to_csv(out_dir / "protein_and_nmd_consequences_v24.tsv", sep="\t", index=False)
+            receipt["protein_consequences_evaluated"] = int(len(prot_df))
+    elif args.events is not None and (args.gtf is not None or args.splicenet_modules is not None):
+        ev_only = _read_table(args.events).copy()
+        receipt = {"version": __version__, "library": lib.name, "mode": "consequences_or_bridge_only"}
+        if args.gtf is not None:
+            prot_df = trace_protein_and_nmd_consequences(ev_only.head(500), args.gtf, args.fasta, indexed_fasta_cls=IndexedFasta, species=args.species)
+            prot_df.to_csv(out_dir / "protein_and_nmd_consequences_v24.tsv", sep="\t", index=False)
+            receipt["protein_consequences_evaluated"] = int(len(prot_df))
+        if args.splicenet_modules is not None:
+            from katana_splicetrace.module_bridge import bridge_splicenet_modules_to_rbps
+            from katana_splicetrace.fast_accel import fast_score_mean_log_odds
+            mod_in = _read_table(args.splicenet_modules)
+            br_df = bridge_splicenet_modules_to_rbps(mod_in, ev_only, args.fasta, lib, extract_rna_fn=extract_event_rna_v2, score_odds_fn=fast_score_mean_log_odds, n_permutations=args.permutations, seed=args.seed)
+            br_df.to_csv(out_dir / "module_x_rbp_bridge_v24.tsv", sep="\t", index=False)
+            receipt["bridged_module_rbp_rows"] = int(len(br_df))
     else:
         parser.error("Provide --rmats, --foreground/--background, or a library command (--list-rbps / --import-motifs / --install-pack).")
 

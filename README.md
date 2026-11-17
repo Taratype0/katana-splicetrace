@@ -1,4 +1,4 @@
-# katana-splicetrace (`v2.4.1`) — KatanaAS Suite
+# katana-splicetrace (`v2.4.2`) — KatanaAS Suite
 
 [![CI](https://github.com/Taratype0/katana-splicetrace/actions/workflows/ci.yml/badge.svg)](https://github.com/Taratype0/katana-splicetrace/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
@@ -6,7 +6,7 @@
 
 KatanaAS high-speed bulk alternative splicing RBP regulator discovery, mature-mRNA motif tracing, and automated GTF ORF/NMD/domain consequence engine.
 
-## Highlights in `v2.4.1`
+## Highlights in `v2.4.2`
 - **Multi-Core Server Acceleration (`Numba @njit` + `mmap` FASTA + `float32` BLAS)**: Scales across all SLURM / HPC CPU cores (`--threads`), accelerating full 169-RBP / 621-PWM scans by **`15x–40x`**.
 - **Automated GTF `ORF / Frameshift / NMD / Protein Domain` Consequence Engine (`--gtf`)**: Reconstructs full-length Inclusion vs Exclusion host mRNAs from standard GENCODE/Ensembl `.gtf[.gz]`, evaluates the Nagy-Maquat `50-nt` EJC **NMD decay / Poison Exon** rule, and detects disrupted conserved catalytic/binding domains, transmembrane helices, NLS & IDRs — zero manual configuration required.
 - **Bundled Library `v3.0` (`169` RBPs / `621` PWMs) + 5-Format Extensible Plugin Engine**: Includes `YTHDC1` (`UGGACU`), `SRRM4`, `RBM20`, `RBM10`, `RBM39`, `SON`, `--species human|mouse`, and `.meme` / `.motif` / `.jaspar` / `.tsv` / `.json.gz` custom motif expansion.

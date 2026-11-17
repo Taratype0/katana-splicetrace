@@ -1,4 +1,4 @@
-"""Unit tests for katana-splicetrace v2.4.1 (Numba exactness, GTF phase/start_codon, UniProt 194k catalog, & 5 plots)."""
+"""Unit tests for katana-splicetrace v2.4.2 (Numba exactness, GTF phase/start_codon, UniProt 194k catalog, & 5 plots)."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,7 +9,7 @@ from katana_splicetrace.cli import main as cli_main
 
 
 def test_v241_library_uniprot_and_cli() -> None:
-    assert kst.__version__ == "2.4.1"
+    assert kst.__version__ == "2.4.2"
     lib_m = kst.load_bundled_human_rbp_library(species="mouse")
     assert lib_m.n_rbps >= 165
     assert "Ythdc1" in lib_m.rbp_to_models

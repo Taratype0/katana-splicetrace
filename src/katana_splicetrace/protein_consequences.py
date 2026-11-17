@@ -68,24 +68,29 @@ def load_bundled_uniprot_domains(species: str = "auto") -> dict[str, dict]:
     elif cache_key in ("human", "homo_sapiens"):
         df = df[df["species"].eq("human")]
 
+    pfam_col = "pfam_ accessions" if "pfam_ accessions" in df.columns else "pfam_accessions"
     index: dict[str, dict] = {}
-    for g_low, grp in df.groupby("gene_lower", sort=False):
-        first = grp.iloc[0]
-        feats = [
-            {
-                "kind": str(r.feature_kind),
-                "start": int(r.start_aa),
-                "end": int(r.end_aa),
-                "label": str(r.feature_label),
+    for g_low, acc, ulen, pfam, kind, s_aa, e_aa, lbl in zip(
+        df["gene_lower"],
+        df["uniprot_acc"],
+        df["uniprot_len"],
+        df[pfam_col] if pfam_col in df.columns else [""] * len(df),
+        df["feature_kind"],
+        df["start_aa"],
+        df["end_aa"],
+        df["feature_label"],
+    ):
+        gk = str(g_low)
+        ent = index.get(gk)
+        if ent is None:
+            ent = {
+                "uniprot_acc": str(acc),
+                "uniprot_len": int(ulen),
+                "pfam_ids": "" if pd.isna(pfam) else str(pfam),
+                "features": [],
             }
-            for r in grp.itertuples(index=False)
-        ]
-        index[str(g_low)] = {
-            "uniprot_acc": str(first["uniprot_acc"]),
-            "uniprot_len": int(first["uniprot_len"]),
-            "pfam_ids": str(first.get("pfam_ accessions", first.get("pfam_accessions", ""))),
-            "features": feats,
-        }
+            index[gk] = ent
+        ent["features"].append({"kind": str(kind), "start": int(s_aa), "end": int(e_aa), "label": str(lbl)})
     _DOMAIN_CACHE[cache_key] = index
     return index
 
@@ -545,8 +550,10 @@ def trace_protein_and_nmd_consequences(
     if events_df.empty:
         return pd.DataFrame()
 
-    target_genes = set(events_df["gene_id"].dropna().astype(str)) | set(
-        events_df.get("gene_symbol", pd.Series(dtype=str)).dropna().astype(str)
+    target_genes = (
+        set(events_df["gene_id"].dropna().astype(str))
+        | set(events_df.get("gene_symbol", pd.Series(dtype=str)).dropna().astype(str))
+        | set(events_df.get("gene_name", pd.Series(dtype=str)).dropna().astype(str))
     )
     tx_index = load_gtf_coding_transcripts(gtf_path, target_genes=target_genes)
     domain_db = load_bundled_uniprot_domains(species=species)
@@ -557,7 +564,10 @@ def trace_protein_and_nmd_consequences(
         for rec in events_df.to_dict("records"):
             eid = str(rec["event_id"])
             gid = str(rec.get("gene_id", "")).split(".")[0]
-            gsym = str(rec.get("gene_symbol", gid))
+            raw_sym = rec.get("gene_symbol")
+            if raw_sym is None or pd.isna(raw_sym) or str(raw_sym).strip() == "":
+                raw_sym = rec.get("gene_name")
+            gsym = str(raw_sym).strip() if (raw_sym is not None and pd.notna(raw_sym) and str(raw_sym).strip() != "") else gid
             dpsi = float(rec.get("dpsi", 0.0))
             etype = str(rec["event_type"])
             strand = str(rec["strand"])
@@ -565,6 +575,8 @@ def trace_protein_and_nmd_consequences(
             candidates = tx_index.get(gid) or tx_index.get(gsym.lower()) or []
             ranked_hosts = _rank_host_transcripts(candidates, rec)
             host = ranked_hosts[0] if ranked_hosts else None
+            if host is not None and (gsym == gid or gsym.startswith(("ENSG", "ENSMUSG"))) and host.gene_name:
+                gsym = host.gene_name
 
             if host is None or not host.cds_blocks:
                 rows.append({

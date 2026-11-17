@@ -119,7 +119,7 @@ def plot_consequence_landscape_v24(
     ax0.set_xlim(0, 100)
     ax0.set_xlabel("% of Regulated Alternative Splicing Events", fontsize=9, color=NAVY)
     ax0.spines[["top", "right"]].set_visible(False)
-    ax0.set_title(f"{dataset_title} | Proteome & NMD Consequence Composition", fontsize=11, fontweight="bold", color=NAVY)
+    ax0.set_title(f"{dataset_title} | Proteome & NMD Composition", fontsize=9.8, fontweight="bold", color=NAVY)
     ax0.legend(loc="upper center", bbox_to_anchor=(0.5, -0.18), ncol=2, frameon=False, fontsize=7.6)
 
     # Right panel: ΔΨ vs Signed % ORF Length Change on focal_contrast
@@ -352,14 +352,14 @@ def plot_side_by_side_inframe_domains_v24(
         struct_d = [d for d in raw_d if d["kind"] != "REGION"]
         doms = struct_d if struct_d else [d for d in raw_d if "Disordered" not in d["label"]]
         prev_xm = -99.0
-        for d in doms[:7]:
+        for d in sorted(doms[:7], key=lambda item: item["start"]):
             x0 = 100.0 * (d["start"] - 1) / max_l
             wd = max(1.8, 100.0 * (d["end"] - d["start"] + 1) / max_l)
             col = DOMAIN_PALETTE.get(d["kind"], TEAL)
             ax.add_patch(FancyBboxPatch((x0, 1.20), wd, 0.28, boxstyle="round,pad=0.01", facecolor=col, edgecolor=NAVY, linewidth=0.7, alpha=0.82, zorder=3))
             xm = x0 + 0.5 * wd
-            if abs(xm - prev_xm) >= 13.0:
-                lbl = d["label"].split(":", 1)[-1][:18]
+            if xm - prev_xm >= 17.5:
+                lbl = d["label"].split(":", 1)[-1][:17]
                 ax.text(xm, 1.58, lbl, ha="center", va="bottom", fontsize=7.2, color=RED if d["state"] != "intact" else NAVY, fontweight="bold")
                 prev_xm = xm
 
@@ -441,6 +441,16 @@ def plot_lollipop_protein_splicing_map_v24(
 # ---------------------------------------------------------------------------
 # STYLE 5: 4-Stage Causal Alluvial Ribbon Flow (RBP -> AS Type -> Frame -> Proteome Fate)
 # ---------------------------------------------------------------------------
+def _clean_rbp_label(v: object) -> str:
+    if isinstance(v, (list, tuple)):
+        return str(v[0]) if v else "Other / Cis-Flank"
+    s = str(v).strip()
+    if s.startswith("[") and s.endswith("]"):
+        parts = [p.strip(" '\"") for p in s[1:-1].split(",") if p.strip(" '\"")]
+        return parts[0] if parts else "Other / Cis-Flank"
+    return s if s else "Other / Cis-Flank"
+
+
 def plot_causal_alluvial_flow_v24(
     prot_df: pd.DataFrame,
     conseq_df: pd.DataFrame,
@@ -448,8 +458,10 @@ def plot_causal_alluvial_flow_v24(
     contrast_id: str,
 ) -> tuple[Path, Path]:
     df = prot_df.copy()
-    if not conseq_df.empty and "event_id" in conseq_df.columns:
-        rbp_per_ev = conseq_df.groupby("event_id")["RBP"].first().to_dict()
+    if not conseq_df.empty and "event_id" in conseq_df.columns and "RBP" in conseq_df.columns:
+        c_tmp = conseq_df[["event_id", "RBP"]].copy()
+        c_tmp["clean_rbp"] = c_tmp["RBP"].map(_clean_rbp_label)
+        rbp_per_ev = c_tmp.groupby("event_id")["clean_rbp"].first().to_dict()
         df["rbp_group"] = df["event_id"].astype(str).map(rbp_per_ev).fillna("Other / Cis-Flank")
     else:
         df["rbp_group"] = "Regulated AS"
