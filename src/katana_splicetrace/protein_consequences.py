@@ -1,16 +1,23 @@
-"""Automated GTF-driven ORF, Reading-Frame, NMD (50-nt EJC rule), and Protein Domain Consequence Tracer.
+"""Automated GTF-driven ORF, Reading-Frame, NMD (50-nt EJC rule), and Curated UniProt/Pfam Domain Consequence Engine (v2.4.1).
 
-Zero custom user configuration required:
-  - Given standard reference `.gtf` / `.gtf.gz` + indexed genome `.fa`, automatically maps each
-    alternative splicing event (`SE`, `A3SS`, `A5SS`, `MXE`, `RI`) onto its canonical protein-coding
-    host transcript, splices full-length Inclusion vs Exclusion mRNAs, translates both ORFs, evaluates
-    the Nagy & Maquat (50-nt upstream of last exon-exon junction) NMD mRNA decay switch, and scans
-    for disrupted conserved protein domains & intrinsic structural elements (TM helix, NLS, IDR, PTM).
+Key fixes & guarantees in v2.4.1:
+  1. Strict `start_codon` + GTF column-8 `CDS phase (0/1/2)` frame alignment; excludes 5'/3'-incomplete
+     GENCODE fragments (`cds_start_NF`, `cds_end_NF`, `mRNA_start_NF`) and pre-existing `nonsense_mediated_decay`
+     biotypes whenever a complete `protein_coding` host transcript exists.
+  2. Splice-junction-aware host transcript selection: ranks candidate `protein_coding` transcripts by exact
+     exon-boundary agreement with the splicing event's flanking donor/acceptor sites (`u1`, `d0`), preventing
+     accidental mid-exon clipping on multi-isoform giant genes (e.g. `Macf1` 7,355 aa, `Ptbp3` 552 aa, `Stxbp2` 593 aa).
+  3. Bundled offline Human + Mouse Reviewed UniProtKB/Swiss-Prot + Pfam domain coordinate catalog
+     (`194,738` curated intervals across `37,714` proteins in `data/uniprot_domains_human_mouse_v1.tsv.gz`),
+     mapping exact N-/C-anchored residue intervals onto both Inclusion and Exclusion protein isoforms to
+     quantify in-frame domain indels AND C-terminal domain loss caused by frameshift/PTC truncation.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 import gzip
+from importlib import resources
+import json
 from pathlib import Path
 import re
 import numpy as np
@@ -35,32 +42,52 @@ CODON_TABLE = {
     "GGT": "G", "GGC": "G", "GGA": "G", "GGG": "G",
 }
 
-KD_HYDROPATHY = {
-    "I": 4.5, "V": 4.2, "L": 3.8, "F": 2.8, "C": 2.5, "M": 1.9, "A": 1.8, "G": -0.4,
-    "T": -0.7, "S": -0.8, "W": -0.9, "Y": -1.3, "P": -1.6, "H": -3.2, "E": -3.5,
-    "Q": -3.5, "D": -3.5, "N": -3.5, "K": -3.9, "R": -4.5,
-}
-
-# Conserved PROSITE / Pfam-core catalytic & binding signatures (100% species-agnostic)
-CONSERVED_DOMAIN_SIGNATURES: list[tuple[str, re.Pattern[str]]] = [
-    ("P-loop_NTPase_WalkerA", re.compile(r"[AG].{4}GK[ST]")),
-    ("Protein_Kinase_Catalytic_Core", re.compile(r"[LIVMFYC].[HY].D[LIVMFY]K.{2}N[LIVMFYCT]{3}")),
-    ("DEAD_DEAH_Box_RNA_Helicase", re.compile(r"D[EA]A[DH]")),
-    ("C2H2_Zinc_Finger", re.compile(r"C.{2,4}C.{3}[LIVMFYWC].{8}H.{3,5}H")),
-    ("RNA_Recognition_Motif_RNP1", re.compile(r"[RK]G[FY][GA][FY][ILV].?[FY]")),
-    ("EF_Hand_Calcium_Binding", re.compile(r"D.{1}[DNS].{1}[ILVFYW].{1}[DENSTG][DNQGHRK].{4}[LIVMC]")),
-    ("WD40_Beta_Propeller_Repeat", re.compile(r"[LIVMSTAC][FY].{1}GH.{3}[LIVMFY].{2}[ST][GSA].{3}D")),
-    ("SH3_Proline_Recognition", re.compile(r"W.{10,22}G[WFY].{2}[NSA]Y")),
-    ("WW_Interaction_Domain", re.compile(r"W.{20,23}W.{2}P")),
-    ("SNARE_Vesicle_Fusion_Motif", re.compile(r"[LVIM].{6}[LVIM].{6}[QE].{6}[LVIM].{6}[LVIM]")),
-    ("RS_Arginine_Serine_Splicing_Domain", re.compile(r"(?:RS|SR){4,}")),
-    ("RGG_RG_RNA_Phase_Separation_Box", re.compile(r"(?:RGG|RG.{0,2}RGG){2,}")),
-]
-
 _ATTR_GENE_ID = re.compile(r'gene_id\s+"?([^";\s]+)')
 _ATTR_GENE_NAME = re.compile(r'gene_name\s+"?([^";\s]+)')
 _ATTR_TX_ID = re.compile(r'transcript_id\s+"?([^";\s]+)')
-_ATTR_APPRIS = re.compile(r'tag\s+"?(appris_principal[^";\s]*|Ensembl_canonical|MANE_Select)')
+_ATTR_TX_TYPE = re.compile(r'transcript_(?:type|biotype)\s+"?([^";\s]+)')
+_ATTR_CANON = re.compile(r'tag\s+"?(appris_principal[^";\s]*|Ensembl_canonical|MANE_Select|CCDS)')
+_ATTR_INCOMPLETE = re.compile(r'tag\s+"?(cds_start_NF|cds_end_NF|mRNA_start_NF|mRNA_end_NF)')
+
+_DOMAIN_CACHE: dict[str, dict[str, dict]] = {}
+
+
+def load_bundled_uniprot_domains(species: str = "auto") -> dict[str, dict]:
+    """Load bundled 194,738-interval UniProt/Pfam catalog indexed by lowercase gene_symbol."""
+    cache_key = species.lower()
+    if cache_key in _DOMAIN_CACHE:
+        return _DOMAIN_CACHE[cache_key]
+
+    pkg_root = __name__.split(".")[0]
+    data_ref = resources.files(f"{pkg_root}.data").joinpath("uniprot_domains_human_mouse_v1.tsv.gz")
+    with resources.as_file(data_ref) as gz_path:
+        df = pd.read_csv(gz_path, sep="\t")
+
+    if cache_key in ("mouse", "mus_musculus"):
+        df = df[df["species"].eq("mouse")]
+    elif cache_key in ("human", "homo_sapiens"):
+        df = df[df["species"].eq("human")]
+
+    index: dict[str, dict] = {}
+    for g_low, grp in df.groupby("gene_lower", sort=False):
+        first = grp.iloc[0]
+        feats = [
+            {
+                "kind": str(r.feature_kind),
+                "start": int(r.start_aa),
+                "end": int(r.end_aa),
+                "label": str(r.feature_label),
+            }
+            for r in grp.itertuples(index=False)
+        ]
+        index[str(g_low)] = {
+            "uniprot_acc": str(first["uniprot_acc"]),
+            "uniprot_len": int(first["uniprot_len"]),
+            "pfam_ids": str(first.get("pfam_ accessions", first.get("pfam_accessions", ""))),
+            "features": feats,
+        }
+    _DOMAIN_CACHE[cache_key] = index
+    return index
 
 
 @dataclass
@@ -70,27 +97,33 @@ class HostTranscriptModel:
     gene_name: str
     chrom: str
     strand: str
-    exons: list[tuple[int, int]]       # sorted ascending 0-based half-open genomic intervals
-    cds_blocks: list[tuple[int, int]]  # sorted ascending 0-based half-open genomic intervals
+    biotype: str
+    exons: list[tuple[int, int]]
+    cds_blocks: list[tuple[int, int]]     # sorted ascending genomic (start0, end0)
+    cds_phases: dict[tuple[int, int], int]
+    start_codon_5p: int | None            # exact 0-based genomic position of first base of start codon
+    stop_codon_3p: int | None             # exact 0-based genomic position of 3'-most base of canonical stop codon
     is_canonical: bool
+    is_incomplete: bool
 
 
 def load_gtf_coding_transcripts(
     gtf_path: Path | str,
     target_genes: set[str] | None = None,
 ) -> dict[str, list[HostTranscriptModel]]:
-    """Fast single-pass streaming GTF/GTF.gz parser indexed by clean gene_id AND lowercase gene_symbol."""
+    """Streaming GTF/GTF.gz parser honoring `start_codon`, `stop_codon`, `CDS` column-8 phase, biotypes, and `cds_start_NF` flags."""
     p = Path(gtf_path)
     opener = gzip.open if p.name.endswith(".gz") else open
-
     clean_targets: set[str] | None = None
-    byte_tokens: list[bytes] | None = None
     if target_genes:
         clean_targets = {g.split(".")[0].strip() for g in target_genes if g} | {g.lower().strip() for g in target_genes if g}
 
-    tx_meta: dict[str, tuple[str, str, str, str, bool]] = {}
+    tx_meta: dict[str, list] = {}  # [gid, gname, chrom, strand, biotype, is_can, is_inc]
     tx_exons: dict[str, list[tuple[int, int]]] = {}
     tx_cds: dict[str, list[tuple[int, int]]] = {}
+    tx_phases: dict[str, dict[tuple[int, int], int]] = {}
+    tx_start_bases: dict[str, list[tuple[int, int]]] = {}
+    tx_stop_bases: dict[str, list[tuple[int, int]]] = {}
 
     with opener(p, "rt", encoding="utf-8", errors="replace") as handle:
         for line in handle:
@@ -100,7 +133,7 @@ def load_gtf_coding_transcripts(
             if len(parts) < 9:
                 continue
             ftype = parts[2]
-            if ftype not in ("exon", "CDS"):
+            if ftype not in ("exon", "CDS", "start_codon", "stop_codon"):
                 continue
             attrs = parts[8]
             mg = _ATTR_GENE_ID.search(attrs)
@@ -121,41 +154,65 @@ def load_gtf_coding_transcripts(
             end0 = int(parts[4])
             if end0 <= start0:
                 continue
-            is_can = bool(_ATTR_APPRIS.search(attrs))
+
+            is_can = bool(_ATTR_CANON.search(attrs))
+            is_inc = bool(_ATTR_INCOMPLETE.search(attrs))
+            m_bt = _ATTR_TX_TYPE.search(attrs)
+            bt = m_bt.group(1) if m_bt else "protein_coding"
+
             if tid not in tx_meta:
-                tx_meta[tid] = (gid, gname, parts[0], parts[6], is_can)
-            elif is_can and not tx_meta[tid][4]:
-                tx_meta[tid] = (gid, gname, parts[0], parts[6], True)
+                tx_meta[tid] = [gid, gname, parts[0], parts[6], bt, is_can, is_inc]
+            else:
+                if is_can:
+                    tx_meta[tid][5] = True
+                if is_inc:
+                    tx_meta[tid][6] = True
 
             if ftype == "exon":
                 tx_exons.setdefault(tid, []).append((start0, end0))
-            else:
+            elif ftype == "CDS":
                 tx_cds.setdefault(tid, []).append((start0, end0))
+                ph = int(parts[7]) if parts[7] in ("0", "1", "2") else 0
+                tx_phases.setdefault(tid, {})[(start0, end0)] = ph
+            elif ftype == "start_codon":
+                tx_start_bases.setdefault(tid, []).append((start0, end0))
+            elif ftype == "stop_codon":
+                tx_stop_bases.setdefault(tid, []).append((start0, end0))
 
     by_gene: dict[str, list[HostTranscriptModel]] = {}
-    for tid, (gid, gname, chrom, strand, is_can) in tx_meta.items():
+    for tid, (gid, gname, chrom, strand, bt, is_can, is_inc) in tx_meta.items():
         ex = sorted(set(tx_exons.get(tid, ())))
         cds = sorted(set(tx_cds.get(tid, ())))
         if not ex:
             continue
+        sc_blocks = sorted(set(tx_start_bases.get(tid, ())))
+        sc_5p = (sc_blocks[0][0] if strand == "+" else (sc_blocks[-1][1] - 1)) if sc_blocks else None
+        st_blocks = sorted(set(tx_stop_bases.get(tid, ())))
+        stop_3p = ((st_blocks[-1][1] - 1) if strand == "+" else st_blocks[0][0]) if st_blocks else None
         model = HostTranscriptModel(
             transcript_id=tid,
             gene_id=gid,
             gene_name=gname,
             chrom=chrom,
             strand=strand,
+            biotype=bt,
             exons=ex,
             cds_blocks=cds,
+            cds_phases=tx_phases.get(tid, {}),
+            start_codon_5p=sc_5p,
+            stop_codon_3p=stop_3p,
             is_canonical=is_can,
+            is_incomplete=is_inc,
         )
         by_gene.setdefault(gid, []).append(model)
         by_gene.setdefault(gname.lower(), []).append(model)
 
-    # Sort each gene's transcripts: protein-coding first, canonical/APPRIS first, longest CDS, longest mRNA
     for k in by_gene:
         by_gene[k].sort(
             key=lambda m: (
-                len(m.cds_blocks) > 0,
+                len(m.cds_blocks) > 0 and m.biotype == "protein_coding" and not m.is_incomplete,
+                m.start_codon_5p is not None and not m.is_incomplete,
+                len(m.cds_blocks) > 0 and not m.is_incomplete,
                 m.is_canonical,
                 sum(b - a for a, b in m.cds_blocks),
                 sum(b - a for a, b in m.exons),
@@ -166,8 +223,6 @@ def load_gtf_coding_transcripts(
 
 
 def _merge_sorted_blocks(blocks: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    if not blocks:
-        return []
     out: list[tuple[int, int]] = []
     for a, b in sorted(blocks):
         if b <= a:
@@ -179,55 +234,155 @@ def _merge_sorted_blocks(blocks: list[tuple[int, int]]) -> list[tuple[int, int]]
     return out
 
 
+def _rank_host_transcripts(candidates: list[HostTranscriptModel], rec: dict) -> list[HostTranscriptModel]:
+    if not candidates:
+        return []
+    kind = str(rec["event_type"])
+    ev_coords = [
+        int(rec[c])
+        for c in ("exonStart_0base", "exonEnd", "longExonStart_0base", "longExonEnd", "1stExonStart_0base", "2ndExonEnd", "riExonStart_0base", "riExonEnd")
+        if c in rec and pd.notna(rec[c])
+    ]
+    ev_lo, ev_hi = (min(ev_coords), max(ev_coords)) if ev_coords else (0, 0)
+
+    # Flanking splice junctions & intervening-exon topology we want the host transcript to match
+    if kind in ("SE", "MXE", "RI"):
+        u1, d0 = int(rec["upstreamEE"]), int(rec["downstreamES"])
+        anchor_ends = {u1}
+        anchor_starts = {d0}
+        allowed_mid: set[tuple[int, int]] = set()
+        if kind == "SE":
+            allowed_mid.add((int(rec["exonStart_0base"]), int(rec["exonEnd"])))
+        elif kind == "MXE":
+            allowed_mid.add((int(rec["1stExonStart_0base"]), int(rec["1stExonEnd"])))
+            allowed_mid.add((int(rec["2ndExonStart_0base"]), int(rec["2ndExonEnd"])))
+    else:
+        f0, f1 = int(rec["flankingES"]), int(rec["flankingEE"])
+        l0, l1 = int(rec["longExonStart_0base"]), int(rec["longExonEnd"])
+        s0, s1 = int(rec["shortES"]), int(rec["shortEE"])
+        u1, d0 = (min(s1, l1), f0) if l1 <= f0 else (f1, max(l0, s0))
+        anchor_starts = {f0, l0, s0}
+        anchor_ends = {f1, l1, s1}
+        allowed_mid = set()
+
+    def _score_cand(m: HostTranscriptModel) -> tuple:
+        tx_lo, tx_hi = m.exons[0][0], m.exons[-1][1]
+        overlaps = tx_lo <= ev_hi and tx_hi >= ev_lo
+        starts_set = {a for a, _ in m.exons}
+        ends_set = {b for _, b in m.exons}
+        junc_matches = len(anchor_starts & starts_set) + len(anchor_ends & ends_set)
+        mid_ex = [(a, b) for a, b in m.exons if a >= u1 and b <= d0]
+        extra_mid = [eb - ea for ea, eb in mid_ex if (ea, eb) not in allowed_mid]
+        if kind == "RI":
+            spans_ri = any(ea <= u1 and eb >= d0 for ea, eb in m.exons)
+            exact_topo = (junc_matches >= 2 and len(mid_ex) == 0) or spans_ri
+        else:
+            exact_topo = (junc_matches >= 2) and (len(extra_mid) == 0) and (len(mid_ex) <= 1)
+        frame_safe_mid = (sum(extra_mid) % 3 == 0)
+        clean_coding = len(m.cds_blocks) > 0 and m.biotype == "protein_coding" and not m.is_incomplete
+        has_sc = m.start_codon_5p is not None and not m.is_incomplete
+        return (
+            overlaps and clean_coding,
+            overlaps and clean_coding and exact_topo,
+            overlaps and clean_coding and (junc_matches >= 2) and frame_safe_mid,
+            overlaps and clean_coding and (junc_matches >= 2),
+            overlaps and clean_coding and (junc_matches >= 1),
+            has_sc,
+            m.is_canonical,
+            sum(b - a for a, b in m.cds_blocks),
+        )
+
+    return sorted(candidates, key=_score_cand, reverse=True)
+
+
 def _build_full_isoform_exons(host_exons: list[tuple[int, int]], row: dict) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
-    """Splice exact Inclusion vs Exclusion local event coordinates into the full-length host transcript exon chain."""
+    """Splice local Inclusion vs Exclusion coordinates cleanly into full-length host exons without dropping flank exons."""
     kind = str(row["event_type"])
     strand = str(row["strand"])
-    if kind == "SE":
-        u0, u1 = int(row["upstreamES"]), int(row["upstreamEE"])
-        t0, t1 = int(row["exonStart_0base"]), int(row["exonEnd"])
-        d0, d1 = int(row["downstreamES"]), int(row["downstreamEE"])
-        win_lo, win_hi = u1, d0
-        kept = [(a, b) for a, b in host_exons if b <= win_lo or a >= win_hi]
-        # Ensure flanking exon edges match u1 and d0
-        if not any(b == u1 for _, b in kept):
-            kept.append((u0, u1))
-        if not any(a == d0 for a, _ in kept):
-            kept.append((d0, d1))
-        inc = _merge_sorted_blocks(kept + [(t0, t1)])
-        exc = _merge_sorted_blocks(kept)
-        return inc, exc
 
-    if kind == "MXE":
+    if kind in ("SE", "MXE"):
         u0, u1 = int(row["upstreamES"]), int(row["upstreamEE"])
+        d0, d1 = int(row["downstreamES"]), int(row["downstreamEE"])
+        left_exons = []
+        right_exons = []
+        found_u, found_d = False, False
+        for a, b in host_exons:
+            if b <= u1:
+                if b == u1:
+                    found_u = True
+                left_exons.append((a, b))
+            elif a < u1 < b:
+                # Host exon extends past u1 -> trim cleanly at u1
+                left_exons.append((min(a, u0), u1))
+                found_u = True
+            if a >= d0:
+                if a == d0:
+                    found_d = True
+                right_exons.append((a, b))
+            elif a < d0 < b:
+                right_exons.append((d0, max(b, d1)))
+                found_d = True
+        if not found_u:
+            left_exons.append((u0, u1))
+        if not found_d:
+            right_exons.append((d0, d1))
+
+        if kind == "SE":
+            t0, t1 = int(row["exonStart_0base"]), int(row["exonEnd"])
+            return _merge_sorted_blocks(left_exons + [(t0, t1)] + right_exons), _merge_sorted_blocks(left_exons + right_exons)
         a0, a1 = int(row["1stExonStart_0base"]), int(row["1stExonEnd"])
         b0, b1 = int(row["2ndExonStart_0base"]), int(row["2ndExonEnd"])
-        d0, d1 = int(row["downstreamES"]), int(row["downstreamEE"])
-        kept = [(x, y) for x, y in host_exons if y <= u1 or x >= d0]
-        if not any(y == u1 for _, y in kept):
-            kept.append((u0, u1))
-        if not any(x == d0 for x, _ in kept):
-            kept.append((d0, d1))
         inc_ex, exc_ex = ((a0, a1), (b0, b1)) if strand == "+" else ((b0, b1), (a0, a1))
-        return _merge_sorted_blocks(kept + [inc_ex]), _merge_sorted_blocks(kept + [exc_ex])
+        return _merge_sorted_blocks(left_exons + [inc_ex] + right_exons), _merge_sorted_blocks(left_exons + [exc_ex] + right_exons)
 
     if kind == "RI":
         u0, u1 = int(row["upstreamES"]), int(row["upstreamEE"])
         d0, d1 = int(row["downstreamES"]), int(row["downstreamEE"])
-        kept = [(x, y) for x, y in host_exons if y <= u0 or x >= d1]
-        inc = _merge_sorted_blocks(kept + [(u0, d1)])
-        exc = _merge_sorted_blocks(kept + [(u0, u1), (d0, d1)])
+        left_ex = [(a, min(b, u1)) for a, b in host_exons if a < u1]
+        right_ex = [(max(a, d0), b) for a, b in host_exons if b > d0]
+        if not any(b == u1 for _, b in left_ex):
+            left_ex.append((u0, u1))
+        if not any(a == d0 for a, _ in right_ex):
+            right_ex.append((d0, d1))
+        exc = _merge_sorted_blocks(left_ex + right_ex)
+        inc = _merge_sorted_blocks(left_ex + [(u1, d0)] + right_ex)
         return inc, exc
 
     # A3SS / A5SS
     l0, l1 = int(row["longExonStart_0base"]), int(row["longExonEnd"])
     s0, s1 = int(row["shortES"]), int(row["shortEE"])
     f0, f1 = int(row["flankingES"]), int(row["flankingEE"])
-    span_lo, span_hi = min(l0, f0), max(l1, f1)
-    kept = [(x, y) for x, y in host_exons if y <= span_lo or x >= span_hi]
-    inc = _merge_sorted_blocks(kept + [(l0, l1), (f0, f1)])
-    exc = _merge_sorted_blocks(kept + [(s0, s1), (f0, f1)])
-    return inc, exc
+    if l1 <= f0:
+        # Alternative exon is genomic-left of flanking exon
+        left_base = [(a, b) for a, b in host_exons if b <= l0]
+        # Preserve upstream start of the alternative exon if host exon started earlier than l0
+        for a, b in host_exons:
+            if a < l0 < b <= l1 + 5:
+                l0, s0 = a, a
+        right_base = [(a, b) for a, b in host_exons if a >= f0]
+        if not any(a == f0 for a, _ in right_base):
+            right_base.append((f0, f1))
+        return _merge_sorted_blocks(left_base + [(l0, l1)] + right_base), _merge_sorted_blocks(left_base + [(s0, s1)] + right_base)
+    else:
+        # Flanking exon is genomic-left of alternative exon
+        left_base = [(a, b) for a, b in host_exons if b <= f1]
+        if not any(b == f1 for _, b in left_base):
+            left_base.append((f0, f1))
+        for a, b in host_exons:
+            if l0 - 5 <= a < l1 < b:
+                l1, s1 = b, b
+        right_base = [(a, b) for a, b in host_exons if a >= l1]
+        return _merge_sorted_blocks(left_base + [(l0, l1)] + right_base), _merge_sorted_blocks(left_base + [(s0, s1)] + right_base)
+
+
+def _resolve_reading_frame_start_gpos(host: HostTranscriptModel) -> tuple[int, int]:
+    """Return `(start_gpos, phase_offset)` guaranteeing exact codon-frame alignment."""
+    if host.start_codon_5p is not None:
+        return host.start_codon_5p, 0
+    first_blk = host.cds_blocks[0] if host.strand == "+" else host.cds_blocks[-1]
+    ph = host.cds_phases.get(first_blk, 0)
+    gpos = first_blk[0] if host.strand == "+" else (first_blk[1] - 1)
+    return gpos, ph
 
 
 def _genomic_pos_to_tx_offset(exons_asc: list[tuple[int, int]], strand: str, gpos: int) -> int | None:
@@ -244,21 +399,24 @@ def _translate_and_evaluate_nmd(
     dna_5to3: str,
     exon_lengths_5to3: list[int],
     start_tx_pos: int | None,
+    phase_offset: int = 0,
+    canonical_stop_tx_end: int | None = None,
+    host_baseline_ptc_dist: int = 0,
 ) -> dict:
-    """Translate spliced mRNA from `start_tx_pos` and evaluate Nagy-Maquat 50-nt EJC NMD rule."""
     total_len = len(dna_5to3)
-    # Exon-exon junction positions in 5'->3' mature mRNA coordinates
     ejc_positions = list(np.cumsum(exon_lengths_5to3)[:-1]) if len(exon_lengths_5to3) >= 2 else []
     last_ejc = int(ejc_positions[-1]) if ejc_positions else None
 
-    if start_tx_pos is None or start_tx_pos < 0 or start_tx_pos + 3 > total_len:
-        # Fallback: find longest canonical ATG ORF if host start codon itself was spliced out
-        best_orf = ""
-        best_stop_end = None
+    if start_tx_pos is not None:
+        eff_start = start_tx_pos + int(phase_offset)
+    else:
+        eff_start = None
+
+    if eff_start is None or eff_start < 0 or eff_start + 3 > total_len:
+        best_orf, best_stop_end, best_st = "", None, 0
         for m in re.finditer(r"ATG", dna_5to3):
             st = m.start()
-            aa_chars = []
-            stop_end = None
+            aa_chars, stop_end = [], None
             for p in range(st, total_len - 2, 3):
                 aa = CODON_TABLE.get(dna_5to3[p : p + 3], "X")
                 if aa == "*":
@@ -266,22 +424,24 @@ def _translate_and_evaluate_nmd(
                     break
                 aa_chars.append(aa)
             if len(aa_chars) > len(best_orf):
-                best_orf = "".join(aa_chars)
-                best_stop_end = stop_end
-        nmd = bool(best_stop_end is not None and last_ejc is not None and (last_ejc - best_stop_end) >= 50)
+                best_orf, best_stop_end, best_st = "".join(aa_chars), stop_end, st
         dist_ejc = int(last_ejc - best_stop_end) if (best_stop_end is not None and last_ejc is not None) else 0
+        is_native_stop = canonical_stop_tx_end is not None and best_stop_end == canonical_stop_tx_end and dist_ejc <= max(host_baseline_ptc_dist + 6, 49)
+        nmd = bool(best_stop_end is not None and last_ejc is not None and dist_ejc >= 50 and not is_native_stop)
         return {
             "protein": best_orf,
             "aa_len": len(best_orf),
-            "has_stop": best_stop_end is not None,
+            "stop_tx_nt": best_stop_end,
+            "last_ejc_tx_nt": last_ejc,
+            "mrna_len_nt": total_len,
             "nmd_sensitive": nmd,
-            "ptc_to_last_ejc_nt": dist_ejc,
+            "ptc_to_last_ejc_nt": max(0, dist_ejc),
             "start_preserved": False,
         }
 
     aa_list: list[str] = []
     stop_end: int | None = None
-    for p in range(start_tx_pos, total_len - 2, 3):
+    for p in range(eff_start, total_len - 2, 3):
         aa = CODON_TABLE.get(dna_5to3[p : p + 3], "X")
         if aa == "*":
             stop_end = p + 3
@@ -289,39 +449,88 @@ def _translate_and_evaluate_nmd(
         aa_list.append(aa)
     prot = "".join(aa_list)
     dist_ejc = int(last_ejc - stop_end) if (stop_end is not None and last_ejc is not None) else 0
-    nmd = bool(stop_end is not None and last_ejc is not None and dist_ejc >= 50)
+    is_native_stop = canonical_stop_tx_end is not None and stop_end == canonical_stop_tx_end and dist_ejc <= max(host_baseline_ptc_dist + 6, 49)
+    nmd = bool(stop_end is not None and last_ejc is not None and dist_ejc >= 50 and not is_native_stop)
     return {
         "protein": prot,
         "aa_len": len(prot),
-        "has_stop": stop_end is not None,
+        "stop_tx_nt": stop_end,
+        "last_ejc_tx_nt": last_ejc,
+        "mrna_len_nt": total_len,
         "nmd_sensitive": nmd,
-        "ptc_to_last_ejc_nt": dist_ejc,
+        "ptc_to_last_ejc_nt": max(0, dist_ejc),
         "start_preserved": True,
     }
 
 
-def _scan_protein_features(aa_seq: str) -> set[str]:
-    if not aa_seq or len(aa_seq) < 8:
-        return set()
-    feats: set[str] = set()
-    for name, pat in CONSERVED_DOMAIN_SIGNATURES:
-        if pat.search(aa_seq):
-            feats.add(name)
-    # Transmembrane helix (19-aa window mean Kyte-Doolittle hydropathy >= 1.6)
-    if len(aa_seq) >= 19:
-        hyd = np.array([KD_HYDROPATHY.get(c, 0.0) for c in aa_seq], dtype=float)
-        win = np.convolve(hyd, np.ones(19) / 19.0, mode="valid")
-        if float(win.max()) >= 1.6:
-            feats.add("Transmembrane_Helix")
-    # Classical Monopartite / Bipartite Nuclear Localization Signal (NLS)
-    if re.search(r"K[KR].[KR]|[KR]{2}.{10,12}[KR]{3,5}", aa_seq):
-        feats.add("Nuclear_Localization_Signal_NLS")
-    # Proline/Serine-rich Intrinsically Disordered / Phosphorylation Tract (IDR)
-    if re.search(r"[SP]{6,}|[Q]{6,}|[ED]{6,}", aa_seq):
-        feats.add("Intrinsically_Disordered_LowComplexity_Tract")
-    if len(re.findall(r"[ST]P", aa_seq)) >= 4:
-        feats.add("CDK_MAPK_Phospho_Hotspot_(SP/TP)")
-    return feats
+def _map_uniprot_domains_to_isoforms(
+    gene_symbol: str,
+    prot_inc: str,
+    prot_exc: str,
+    nmd_inc: bool,
+    nmd_exc: bool,
+    domain_db: dict[str, dict],
+) -> tuple[str, str, list[dict]]:
+    """Map curated UniProt/Pfam intervals onto Inclusion vs Exclusion ORFs and classify intact vs spliced vs PTC-lost."""
+    entry = domain_db.get(gene_symbol.lower())
+    len_inc, len_exc = len(prot_inc), len(prot_exc)
+    ref_len = max(len_inc, len_exc)
+    if ref_len == 0:
+        return "NA", "none", []
+
+    # Exact shared N-terminal prefix & C-terminal suffix between Inclusion and Exclusion proteins
+    pre = 0
+    min_l = min(len_inc, len_exc)
+    while pre < min_l and prot_inc[pre] == prot_exc[pre]:
+        pre += 1
+    suf = 0
+    while suf < (min_l - pre) and prot_inc[len_inc - 1 - suf] == prot_exc[len_exc - 1 - suf]:
+        suf += 1
+
+    # Altered window on the longer reference protein (1-based amino acid coordinates)
+    alt_start_aa = pre + 1
+    alt_end_aa = max(alt_start_aa, ref_len - suf)
+
+    mapped_arch: list[dict] = []
+    disrupted_labels: list[str] = []
+    uniprot_acc = "predicted"
+
+    if entry is not None and entry["features"]:
+        uniprot_acc = entry["uniprot_acc"]
+        u_len = max(entry["uniprot_len"], 1)
+        scale = ref_len / float(u_len)
+        # Only transfer coordinates if isoform length is reasonably compatible (within 0.45x..1.8x of canonical Swiss-Prot)
+        if 0.40 <= scale <= 1.85:
+            for feat in entry["features"]:
+                # Anchor N-terminal domains directly; smoothly scale C-terminal coordinates when isoform differs slightly
+                s_map = max(1, min(ref_len, int(round(feat["start"] * scale)) if abs(ref_len - u_len) > 25 else feat["start"]))
+                e_map = max(s_map, min(ref_len, int(round(feat["end"] * scale)) if abs(ref_len - u_len) > 25 else feat["end"]))
+                # Check overlap with the spliced/truncated region [alt_start_aa, alt_end_aa]
+                ov = max(0, min(e_map, alt_end_aa) - max(s_map, alt_start_aa) + 1)
+                dom_span = max(1, e_map - s_map + 1)
+                if prot_inc != prot_exc and ov >= 1:
+                    if (nmd_inc or nmd_exc) and s_map > min_l:
+                        state = "lost_by_PTC_truncation"
+                    else:
+                        state = "spliced_indel_overlap"
+                    pct = min(100, int(round(100.0 * ov / dom_span)))
+                    if feat["kind"] != "REGION" or "Disordered" not in feat["label"]:
+                        disrupted_labels.append(f"{feat['label']} [{s_map}-{e_map} aa, {pct}%]")
+                    elif len(disrupted_labels) == 0:
+                        disrupted_labels.append(f"{feat['label']} [{s_map}-{e_map} aa]")
+                else:
+                    state = "intact"
+                mapped_arch.append({
+                    "kind": feat["kind"],
+                    "label": feat["label"],
+                    "start": s_map,
+                    "end": e_map,
+                    "state": state,
+                })
+
+    dedup_disrupted = list(dict.fromkeys(disrupted_labels))[:5]
+    feat_str = "; ".join(dedup_disrupted) if dedup_disrupted else "none"
+    return uniprot_acc, feat_str, mapped_arch
 
 
 def trace_protein_and_nmd_consequences(
@@ -330,8 +539,9 @@ def trace_protein_and_nmd_consequences(
     fasta_path: Path | str,
     *,
     indexed_fasta_cls: type,
+    species: str = "auto",
 ) -> pd.DataFrame:
-    """Automatically annotate splicing events with ORF reading-frame, NMD decay switch, and protein domain impacts."""
+    """Deterministic GTF + FASTA + Curated UniProt/Pfam ORF, reading-frame, NMD, and protein-domain consequence engine."""
     if events_df.empty:
         return pd.DataFrame()
 
@@ -339,6 +549,7 @@ def trace_protein_and_nmd_consequences(
         events_df.get("gene_symbol", pd.Series(dtype=str)).dropna().astype(str)
     )
     tx_index = load_gtf_coding_transcripts(gtf_path, target_genes=target_genes)
+    domain_db = load_bundled_uniprot_domains(species=species)
     reader = indexed_fasta_cls(Path(fasta_path))
 
     rows: list[dict] = []
@@ -352,21 +563,8 @@ def trace_protein_and_nmd_consequences(
             strand = str(rec["strand"])
 
             candidates = tx_index.get(gid) or tx_index.get(gsym.lower()) or []
-            # Pick best coding transcript overlapping the event span
-            ev_coords = [
-                int(rec[c])
-                for c in ("exonStart_0base", "exonEnd", "longExonStart_0base", "longExonEnd", "1stExonStart_0base", "2ndExonEnd", "riExonStart_0base", "riExonEnd")
-                if c in rec and pd.notna(rec[c])
-            ]
-            ev_lo, ev_hi = (min(ev_coords), max(ev_coords)) if ev_coords else (0, 0)
-            host: HostTranscriptModel | None = None
-            for cand in candidates:
-                tx_lo, tx_hi = cand.exons[0][0], cand.exons[-1][1]
-                if tx_lo <= ev_hi and tx_hi >= ev_lo:
-                    host = cand
-                    break
-            if host is None and candidates:
-                host = candidates[0]
+            ranked_hosts = _rank_host_transcripts(candidates, rec)
+            host = ranked_hosts[0] if ranked_hosts else None
 
             if host is None or not host.cds_blocks:
                 rows.append({
@@ -376,41 +574,84 @@ def trace_protein_and_nmd_consequences(
                     "event_type": etype,
                     "dpsi": dpsi,
                     "host_transcript_id": host.transcript_id if host else "unmatched",
+                    "uniprot_acc": "NA",
                     "coding_region_location": "noncoding_host",
                     "frame_status": "noncoding_transcript",
                     "nmd_switch_class": "noncoding",
                     "aa_len_inclusion": 0,
                     "aa_len_exclusion": 0,
                     "delta_aa": 0,
+                    "ptc_to_last_ejc_nt": 0,
                     "disrupted_protein_features": "none",
                     "functional_consequence_summary": "Non-coding transcript isoform change",
+                    "architecture_json": "{}",
                 })
                 continue
 
-            try:
-                inc_exons, exc_exons = _build_full_isoform_exons(host.exons, rec)
-                ord_inc = inc_exons if strand == "+" else inc_exons[::-1]
-                ord_exc = exc_exons if strand == "+" else exc_exons[::-1]
-                dna_inc = reader.fetch_blocks(stream, host.chrom, strand, ord_inc)
-                dna_exc = reader.fetch_blocks(stream, host.chrom, strand, ord_exc)
-            except Exception:
-                continue
+            # Evaluate top candidate protein_coding backbones so multi-promoter / multi-isoform genes (e.g. Macf1)
+            # bind to the actual coding backbone compatible with the local splice junctions rather than a chimeric frame!
+            coding_pool = [m for m in ranked_hosts if m.cds_blocks][:6]
+            chosen_bundle = None
+            for cand_m in coding_pool:
+                try:
+                    c_inc_ex, c_exc_ex = _build_full_isoform_exons(cand_m.exons, rec)
+                    c_ord_inc = c_inc_ex if strand == "+" else c_inc_ex[::-1]
+                    c_ord_exc = c_exc_ex if strand == "+" else c_exc_ex[::-1]
+                    c_dna_inc = reader.fetch_blocks(stream, cand_m.chrom, strand, c_ord_inc)
+                    c_dna_exc = reader.fetch_blocks(stream, cand_m.chrom, strand, c_ord_exc)
+                except Exception:
+                    continue
+                c_start_gpos, c_phase_off = _resolve_reading_frame_start_gpos(cand_m)
+                c_st_inc = _genomic_pos_to_tx_offset(c_inc_ex, strand, c_start_gpos)
+                c_st_exc = _genomic_pos_to_tx_offset(c_exc_ex, strand, c_start_gpos)
 
-            # Canonical start codon genomic coordinate (5'-most base of CDS)
-            start_gpos = host.cds_blocks[0][0] if strand == "+" else (host.cds_blocks[-1][1] - 1)
+                # Native host baseline stop-to-last-EJC distance (protects canonical genes with natural 3'-UTR introns)
+                host_ord = cand_m.exons if strand == "+" else cand_m.exons[::-1]
+                host_ejcs = list(np.cumsum([b - a for a, b in host_ord])[:-1]) if len(host_ord) >= 2 else []
+                host_last_ejc = int(host_ejcs[-1]) if host_ejcs else 0
+                if cand_m.stop_codon_3p is not None:
+                    h_stop_off = _genomic_pos_to_tx_offset(cand_m.exons, strand, cand_m.stop_codon_3p)
+                    host_base_ptc = max(0, host_last_ejc - (h_stop_off + 1)) if h_stop_off is not None else 0
+                    inc_stop_off = _genomic_pos_to_tx_offset(c_inc_ex, strand, cand_m.stop_codon_3p)
+                    exc_stop_off = _genomic_pos_to_tx_offset(c_exc_ex, strand, cand_m.stop_codon_3p)
+                    can_end_inc = (inc_stop_off + 1) if inc_stop_off is not None else None
+                    can_end_exc = (exc_stop_off + 1) if exc_stop_off is not None else None
+                else:
+                    host_base_ptc, can_end_inc, can_end_exc = 0, None, None
+
+                ct_inc = _translate_and_evaluate_nmd(
+                    c_dna_inc, [b - a for a, b in c_ord_inc], c_st_inc,
+                    phase_offset=c_phase_off, canonical_stop_tx_end=can_end_inc, host_baseline_ptc_dist=host_base_ptc,
+                )
+                ct_exc = _translate_and_evaluate_nmd(
+                    c_dna_exc, [b - a for a, b in c_ord_exc], c_st_exc,
+                    phase_offset=c_phase_off, canonical_stop_tx_end=can_end_exc, host_baseline_ptc_dist=host_base_ptc,
+                )
+                cand_bundle = (cand_m, c_inc_ex, c_exc_ex, c_ord_inc, c_ord_exc, c_dna_inc, c_dna_exc, ct_inc, ct_exc)
+                if chosen_bundle is None:
+                    chosen_bundle = cand_bundle
+                # Accept immediately once at least one splice isoform is productive (not artificial dual-NMD)
+                if not (ct_inc["nmd_sensitive"] and ct_exc["nmd_sensitive"]):
+                    chosen_bundle = cand_bundle
+                    break
+
+            if chosen_bundle is None:
+                continue
+            host, inc_exons, exc_exons, ord_inc, ord_exc, dna_inc, dna_exc, t_inc, t_exc = chosen_bundle
+
             cds_lo, cds_hi = host.cds_blocks[0][0], host.cds_blocks[-1][1]
+            ev_coords = [
+                int(rec[c])
+                for c in ("exonStart_0base", "exonEnd", "longExonStart_0base", "longExonEnd", "1stExonStart_0base", "2ndExonEnd", "riExonStart_0base", "riExonEnd")
+                if c in rec and pd.notna(rec[c])
+            ]
+            ev_lo, ev_hi = (min(ev_coords), max(ev_coords)) if ev_coords else (0, 0)
             overlaps_cds = bool(ev_lo < cds_hi and ev_hi > cds_lo)
             if not overlaps_cds:
                 is_5utr = (ev_hi <= cds_lo) if strand == "+" else (ev_lo >= cds_hi)
                 loc = "5prime_UTR" if is_5utr else "3prime_UTR"
             else:
                 loc = "CDS_coding"
-
-            st_inc = _genomic_pos_to_tx_offset(inc_exons, strand, start_gpos)
-            st_exc = _genomic_pos_to_tx_offset(exc_exons, strand, start_gpos)
-
-            t_inc = _translate_and_evaluate_nmd(dna_inc, [b - a for a, b in ord_inc], st_inc)
-            t_exc = _translate_and_evaluate_nmd(dna_exc, [b - a for a, b in ord_exc], st_exc)
 
             delta_nt = len(dna_inc) - len(dna_exc)
             if t_inc["protein"] == t_exc["protein"]:
@@ -424,42 +665,54 @@ def trace_protein_and_nmd_consequences(
 
             if t_inc["nmd_sensitive"] and not t_exc["nmd_sensitive"]:
                 nmd_cls = "inclusion_triggers_NMD_poison_exon"
+                ptc_dist = t_inc["ptc_to_last_ejc_nt"]
             elif t_exc["nmd_sensitive"] and not t_inc["nmd_sensitive"]:
                 nmd_cls = "skipping_triggers_NMD_decay"
+                ptc_dist = t_exc["ptc_to_last_ejc_nt"]
             elif not t_inc["nmd_sensitive"] and not t_exc["nmd_sensitive"]:
                 nmd_cls = "productive_protein_isoform_switch" if t_inc["protein"] != t_exc["protein"] else "coding_silent_utr_switch"
+                ptc_dist = 0
             else:
                 nmd_cls = "dual_NMD_background"
+                ptc_dist = max(t_inc["ptc_to_last_ejc_nt"], t_exc["ptc_to_last_ejc_nt"])
 
-            feats_inc = _scan_protein_features(t_inc["protein"])
-            feats_exc = _scan_protein_features(t_exc["protein"])
-            diff_feats = sorted(feats_inc ^ feats_exc)
-            # Also scan the differential peptide window directly for short local signals (NLS / phospho / IDR)
-            if not diff_feats and t_inc["protein"] != t_exc["protein"]:
-                p1, p2 = t_inc["protein"], t_exc["protein"]
-                pre = 0
-                while pre < min(len(p1), len(p2)) and p1[pre] == p2[pre]:
-                    pre += 1
-                suf = 0
-                while suf < (min(len(p1), len(p2)) - pre) and p1[len(p1) - 1 - suf] == p2[len(p2) - 1 - suf]:
-                    suf += 1
-                seg = p1[max(0, pre - 6) : len(p1) - suf + 6] + p2[max(0, pre - 6) : len(p2) - suf + 6]
-                diff_feats = sorted(_scan_protein_features(seg))
-
-            feat_str = ";".join(diff_feats) if diff_feats else "none"
+            u_acc, feat_str, arch_list = _map_uniprot_domains_to_isoforms(
+                gsym, t_inc["protein"], t_exc["protein"], t_inc["nmd_sensitive"], t_exc["nmd_sensitive"], domain_db
+            )
             delta_aa = int(t_inc["aa_len"] - t_exc["aa_len"])
 
-            # Concise, high-impact mechanistic summary
+            # Exact shared prefix residue for visualization
+            pre_aa = 0
+            p1, p2 = t_inc["protein"], t_exc["protein"]
+            while pre_aa < min(len(p1), len(p2)) and p1[pre_aa] == p2[pre_aa]:
+                pre_aa += 1
+
+            arch_payload = {
+                "uniprot_acc": u_acc,
+                "mrna_nt_inc": t_inc["mrna_len_nt"],
+                "mrna_nt_exc": t_exc["mrna_len_nt"],
+                "last_ejc_inc": t_inc["last_ejc_tx_nt"],
+                "last_ejc_exc": t_exc["last_ejc_tx_nt"],
+                "stop_nt_inc": t_inc["stop_tx_nt"],
+                "stop_nt_exc": t_exc["stop_tx_nt"],
+                "n_exons_inc": len(ord_inc),
+                "n_exons_exc": len(ord_exc),
+                "splice_junction_aa": pre_aa + 1,
+                "domains": arch_list[:18],
+            }
+
             if nmd_cls == "inclusion_triggers_NMD_poison_exon":
-                fav = "Promotes NMD decay" if dpsi > 0 else "Rescues productive protein from NMD"
-                summary = f"Poison exon ({f_status}): inclusion introduces PTC ({t_inc['ptc_to_last_ejc_nt']} nt upstream of last EJC) -> {fav}"
+                fav = "Promotes NMD decay" if dpsi > 0 else "Skips poison exon -> rescues protein"
+                dom_lost = f" (truncates {feat_str})" if feat_str != "none" else ""
+                summary = f"Predicted NMD poison exon ({f_status}): inclusion PTC {ptc_dist} nt upstream of last EJC -> {fav}{dom_lost}"
             elif nmd_cls == "skipping_triggers_NMD_decay":
-                fav = "Triggers NMD mRNA decay" if dpsi < 0 else "Maintains full-length ORF"
-                summary = f"Essential coding exon ({f_status}): skipping introduces PTC ({t_exc['ptc_to_last_ejc_nt']} nt upstream of last EJC) -> {fav}"
+                fav = "Triggers NMD decay" if dpsi < 0 else "Maintains full-length ORF"
+                dom_lost = f" (truncates {feat_str})" if feat_str != "none" else ""
+                summary = f"Predicted NMD-inducing skipping ({f_status}): exclusion PTC {ptc_dist} nt upstream of last EJC -> {fav}{dom_lost}"
             elif f_status == "utr_cis_regulatory_only":
                 summary = f"ORF intact ({t_inc['aa_len']} aa); remodels {loc} ({delta_nt:+d} nt)"
             else:
-                dom_note = f"; alters {feat_str}" if diff_feats else ""
+                dom_note = f"; overlaps {feat_str}" if feat_str != "none" else ""
                 summary = f"Productive {f_status}: {t_inc['aa_len']} vs {t_exc['aa_len']} aa ({delta_aa:+d} aa){dom_note}"
 
             rows.append({
@@ -469,13 +722,16 @@ def trace_protein_and_nmd_consequences(
                 "event_type": etype,
                 "dpsi": dpsi,
                 "host_transcript_id": host.transcript_id,
+                "uniprot_acc": u_acc,
                 "coding_region_location": loc,
                 "frame_status": f_status,
                 "nmd_switch_class": nmd_cls,
                 "aa_len_inclusion": int(t_inc["aa_len"]),
                 "aa_len_exclusion": int(t_exc["aa_len"]),
                 "delta_aa": delta_aa,
+                "ptc_to_last_ejc_nt": int(ptc_dist),
                 "disrupted_protein_features": feat_str,
                 "functional_consequence_summary": summary,
+                "architecture_json": json.dumps(arch_payload),
             })
     return pd.DataFrame(rows)

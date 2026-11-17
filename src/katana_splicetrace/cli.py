@@ -1,4 +1,4 @@
-"""Standalone CLI for katana-splicetrace (2.4.0) with Extensible Motif Database v3.0."""
+"""Standalone CLI for katana-splicetrace (2.4.1) with Extensible Motif Database v3.0."""
 from __future__ import annotations
 
 import argparse
@@ -16,13 +16,13 @@ from katana_splicetrace.protein_consequences import trace_protein_and_nmd_conseq
 from katana_splicetrace.rna_forms import IndexedFasta, compute_flank_gc_fast, extract_event_rna_v2, trace_motif_instances_v2
 from katana_splicetrace.scanner import run_motiftrace_v2_scan
 
-__version__ = "2.4.0"
+__version__ = "2.4.1"
 
 
 def write_nfcore_versions_yml(path: Path | str, process_name: str = "KATANA_SPLICETRACE") -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(f'"{process_name}":\n    katana-splicetrace: "2.4.0"\n    python: "{platform.python_version()}"\n', encoding="utf-8")
+    p.write_text(f'"{process_name}":\n    katana-splicetrace: "2.4.1"\n    python: "{platform.python_version()}"\n', encoding="utf-8")
 
 
 def add_extensible_library_args(parser: argparse.ArgumentParser) -> None:
@@ -163,10 +163,25 @@ def main(argv: list[str] | None = None) -> int:
         receipt = {"version": __version__, "library": lib.name, "n_rbps": lib.n_rbps, "n_models": lib.n_models, "mode": "rescue_v24", **res22.diagnostics, "elapsed_seconds": round(time.monotonic() - t0, 2)}
         if args.gtf is not None:
             fg_prot_ev = res22.event_contrasts[res22.event_contrasts["_is_fg"]].head(500)
-            prot_df = trace_protein_and_nmd_consequences(fg_prot_ev, args.gtf, args.fasta, indexed_fasta_cls=IndexedFasta)
+            prot_df = trace_protein_and_nmd_consequences(fg_prot_ev, args.gtf, args.fasta, indexed_fasta_cls=IndexedFasta, species=args.species)
             prot_df.to_csv(out_dir / "protein_and_nmd_consequences_v24.tsv", sep="\t", index=False)
             receipt["protein_consequences_evaluated"] = int(len(prot_df))
             receipt["nmd_switch_events"] = int(prot_df["nmd_switch_class"].str.contains("NMD").sum()) if not prot_df.empty else 0
+            try:
+                from katana_splicetrace.protein_viz import (
+                    plot_causal_alluvial_flow_v24,
+                    plot_consequence_landscape_v24,
+                    plot_dual_track_nmd_architecture_v24,
+                    plot_side_by_side_inframe_domains_v24,
+                )
+                if not prot_df.empty:
+                    fig_dir = out_dir / "figures"
+                    plot_consequence_landscape_v24({"contrast": prot_df}, "contrast", fig_dir / "proteome_consequence_landscape")
+                    plot_dual_track_nmd_architecture_v24(prot_df, {}, fig_dir / "nmd_dual_track_architecture", "contrast")
+                    plot_side_by_side_inframe_domains_v24(prot_df, fig_dir / "inframe_domain_remodeling", "contrast")
+                    plot_causal_alluvial_flow_v24(prot_df, res22.mature_consequences, fig_dir / "causal_rbp_to_proteome_alluvial", "contrast")
+            except Exception:
+                pass
         receipt["active_threads"] = int(active_threads)
 
     elif args.foreground is not None and args.background is not None:
