@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "katana-motiftrace"
+version = "2.3.0"
+description = "Calibrated bulk RNA splicing RBP regulator discovery and mature-mRNA motif consequence tracing."
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Tara Maharjan"}]
+requires-python = ">=3.10"
+keywords = ["splicing", "RNA-seq", "RBP", "motif", "m6A", "rMATS", "bioinformatics"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+
+[project.urls]
+Homepage = "https://github.com/Taratype0/katana-motiftrace"
+Repository = "https://github.com/Taratype0/katana-motiftrace"
+Issues = "https://github.com/Taratype0/katana-motiftrace/issues"
+Suite = "https://github.com/Taratype0/Katana-splicing-tool"
+
+[project.scripts]
+katana-motiftrace = "katana_motiftrace.cli:main"
+motiftrace = "katana_motiftrace.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"katana_motiftrace.data" = ["*.gz"]
