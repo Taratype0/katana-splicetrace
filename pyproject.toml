@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "katana-splicetrace"
+version = "2.4.0"
+description = "KatanaAS high-speed bulk alternative splicing RBP regulator discovery, mature-mRNA motif tracing, and automated GTF ORF/NMD/domain consequence engine."
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Tara Maharjan"}]
+requires-python = ">=3.10"
+keywords = ["Katana", "KatanaAS", "alternative-splicing", "RNA-seq", "RBP", "NMD", "bioinformatics"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = ["numpy>=1.24", "scipy>=1.10", "pandas>=2.0"]
+
+[project.optional-dependencies]
+server = ["numba>=0.58"]
+dev = ["pytest>=7.4", "numba>=0.58"]
+
+[project.urls]
+Homepage = "https://github.com/Taratype0/katana-splicetrace"
+Repository = "https://github.com/Taratype0/katana-splicetrace"
+Issues = "https://github.com/Taratype0/katana-splicetrace/issues"
+Suite = "https://github.com/Taratype0/Katana-splicing-tool"
+
+[project.scripts]
+katana-splicetrace = "katana_splicetrace.cli:main"
+splicetrace = "katana_splicetrace.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"katana_splicetrace.data" = ["*.gz"]
