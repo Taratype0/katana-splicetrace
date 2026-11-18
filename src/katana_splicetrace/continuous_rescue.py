@@ -353,6 +353,8 @@ def run_bulk_continuous_rescue_v22(
     rbp_df["sequence_rank"] = np.arange(1, len(rbp_df) + 1, dtype=int)
 
     sig_rbps = rbp_df.loc[rbp_df["rbp_P_FWER"] <= 0.05, "RBP"].tolist()[:10]
+    if not sig_rbps:
+        sig_rbps = rbp_df.loc[rbp_df["nominal_P"] <= 0.01, "RBP"].tolist()[:5]
     conseq_df = pd.DataFrame()
     if sig_rbps:
         sig_m = {m: lib.models[m] for r in sig_rbps for m in lib.rbp_to_models.get(r, ()) if m in lib.models}

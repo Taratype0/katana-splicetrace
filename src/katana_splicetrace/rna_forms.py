@@ -379,7 +379,9 @@ def trace_motif_instances_v2(
         mat = (20.0 * np.asarray(m["matrix"], dtype=float) + 0.025) / 20.1
         odds = mat / 0.25
         rel = mat / mat.max(axis=1, keepdims=True)
-        precomp[mid] = (len(mat), odds, rel, m.get("RBPs", ""))
+        raw_r = m.get("RBPs", "")
+        rbp_clean = ";".join(str(x) for x in raw_r) if isinstance(raw_r, (list, tuple)) else str(raw_r)
+        precomp[mid] = (len(mat), odds, rel, rbp_clean)
 
     hit_rows: list[dict] = []
     change_rows: list[dict] = []

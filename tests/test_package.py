@@ -9,7 +9,7 @@ from katana_splicetrace.cli import main as cli_main
 
 
 def test_v241_library_uniprot_and_cli() -> None:
-    assert kst.__version__ == "2.4.2"
+    assert kst.__version__ == "2.4.3"
     lib_m = kst.load_bundled_human_rbp_library(species="mouse")
     assert lib_m.n_rbps >= 165
     assert "Ythdc1" in lib_m.rbp_to_models

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "katana-splicetrace"
-version = "2.4.2"
+version = "2.4.3"
 description = "KatanaAS high-speed bulk alternative splicing RBP regulator discovery, mature-mRNA motif tracing, and automated GTF ORF/NMD/domain consequence engine."
 readme = "README.md"
 license = {text = "MIT"}

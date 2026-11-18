@@ -1,4 +1,4 @@
-"""Katana-SpliceTrace 2.4.2 — High-speed bulk AS RBP discovery, mature-mRNA motif, Module-RBP bridge & GTF/UniProt ORF/NMD engine."""
+"""Katana-SpliceTrace 2.4.3 — High-speed bulk AS RBP discovery, mature-mRNA motif, Module-RBP bridge & GTF/UniProt ORF/NMD engine."""
 from katana_splicetrace.continuous_rescue import MotifRescueResultV22, run_bulk_continuous_rescue_v22
 from katana_splicetrace.extensible_db import (
     export_katana_motif_pack,
@@ -69,4 +69,4 @@ try:
 except ImportError:
     pass
 
-__version__ = "2.4.2"
+__version__ = "2.4.3"
